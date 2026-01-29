@@ -2,14 +2,9 @@
 // Vercel serverless note: in-memory caches are "best effort" (may reset between cold starts),
 // but they still dramatically reduce RapidAPI usage during bursts/testing.
 
-// Response cache (final payload)
 const RESPONSE_CACHE = new Map(); // cacheKey -> { expires, payload }
-
-// Per-keyword caches
 const EBAY_CACHE = new Map();     // ebayKeywords -> { expires, data }
 const ALI_CACHE = new Map();      // aliKey -> { expires, data }
-
-// Simple rate limit
 const RATE_LIMIT = new Map();     // ip -> { windowStart, count }
 
 function getIp(req) {
@@ -51,26 +46,6 @@ function normalizeAliLink(link) {
   return s;
 }
 
-function parsePriceFromString(s) {
-  if (!s) return 0;
-  const str = String(s).trim();
-  if (!str) return 0;
-
-  // reject very long digit-only strings (IDs)
-  if (/^\d{8,}$/.test(str)) return 0;
-
-  // normalize comma decimals
-  const norm = str.replace(",", ".");
-
-  const m = norm.match(/(\d+(\.\d+)?)/);
-  if (!m) return 0;
-
-  const n = parseFloat(m[1]);
-  if (!Number.isFinite(n)) return 0;
-  if (n <= 0 || n > 10000) return 0; // sanity
-  return n;
-}
-
 function deepFindFirst(obj, predicate, maxNodes = 7000) {
   const stack = [obj];
   let nodes = 0;
@@ -104,37 +79,92 @@ function deepGetByKey(obj, keys) {
   return null;
 }
 
-function aliExtractId(item) {
+function parsePriceFromString(s) {
+  if (!s) return 0;
+  const str = String(s).trim();
+  if (!str) return 0;
+  if (/^\d{8,}$/.test(str)) return 0; // IDs
+
+  const norm = str.replace(",", ".");
+  const m = norm.match(/(\d+(\.\d+)?)/);
+  if (!m) return 0;
+
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return 0;
+  if (n <= 0 || n > 10000) return 0;
+  return n;
+}
+
+// --- AliExpress extractors (fixed to DataHub item_search_2 shape) ---
+function aliExtractId(obj) {
+  const item = obj?.item || obj;
+
+  const direct =
+    item?.itemId ??
+    item?.item_id ??
+    item?.productId ??
+    item?.product_id ??
+    item?.id ??
+    null;
+
+  if (typeof direct === "string" || typeof direct === "number") return String(direct);
+
   const v =
-    deepGetByKey(item, ["itemId", "item_id", "productId", "product_id", "id", "offerId", "offer_id"]) ||
-    "";
+    deepGetByKey(obj, ["itemId", "item_id", "productId", "product_id", "id", "offerId", "offer_id"]) || "";
   return typeof v === "string" || typeof v === "number" ? String(v) : "";
 }
 
-function aliExtractTitle(item) {
-  const v =
-    deepGetByKey(item, ["title", "productTitle", "product_title", "name", "itemTitle", "item_title"]) ||
-    "";
+function aliExtractTitle(obj) {
+  const item = obj?.item || obj;
+
+  const direct = item?.title ?? item?.name ?? null;
+  if (typeof direct === "string") return direct.trim();
+
+  const v = deepGetByKey(obj, ["title", "productTitle", "product_title", "name", "itemTitle", "item_title"]) || "";
   return typeof v === "string" ? v.trim() : String(v || "").trim();
 }
 
-function aliExtractLink(item) {
-  const maybeItem = deepFindFirst(item, (x) => typeof x === "string" && /aliexpress\.com\/item\//i.test(x));
+function aliExtractLink(obj) {
+  const item = obj?.item || obj;
+
+  const direct = item?.itemUrl ?? item?.item_url ?? item?.url ?? null;
+  if (typeof direct === "string" && direct) return normalizeAliLink(direct);
+
+  const maybeItem = deepFindFirst(obj, (x) => typeof x === "string" && /aliexpress\.com\/item\//i.test(x));
   if (typeof maybeItem === "string") return normalizeAliLink(maybeItem);
 
-  const urlLike = deepFindFirst(item, (x) => typeof x === "string" && /aliexpress\.com/i.test(x));
+  const urlLike = deepFindFirst(obj, (x) => typeof x === "string" && /aliexpress\.com/i.test(x));
   if (typeof urlLike === "string") return normalizeAliLink(urlLike);
 
   const v =
-    deepGetByKey(item, ["product_url", "productUrl", "item_url", "itemUrl", "detail_url", "detailUrl", "url"]) ||
-    "";
+    deepGetByKey(obj, ["product_url", "productUrl", "item_url", "itemUrl", "detail_url", "detailUrl", "url"]) || "";
   return normalizeAliLink(typeof v === "string" ? v : String(v || ""));
 }
 
-function aliExtractPrice(item) {
-  // Prefer explicit “formatted/string” price fields if present
+function aliExtractPrice(obj) {
+  const item = obj?.item || obj;
+
+  // PRIMARY: DataHub item_search_2
+  // item.sku.def.promotionPrice OR item.sku.def.price
+  const promo = item?.sku?.def?.promotionPrice;
+  if (typeof promo === "number" && promo > 0) return promo;
+  if (typeof promo === "string") {
+    const n = parsePriceFromString(promo);
+    if (n) return n;
+  }
+
+  const price = item?.sku?.def?.price;
+  if (typeof price === "number" && price > 0) return price;
+  if (typeof price === "string") {
+    const n = parsePriceFromString(price);
+    if (n) return n;
+  }
+
+  // SECONDARY: common variants
   const preferred =
-    deepGetByKey(item, [
+    deepGetByKey(obj, [
+      "promotionPrice",
+      "promotion_price",
       "sale_price_format",
       "price_format",
       "price_str",
@@ -149,15 +179,12 @@ function aliExtractPrice(item) {
       "finalPrice"
     ]) ?? null;
 
-  // number case: may be cents or units; apply cautious heuristic
   if (typeof preferred === "number") {
-    // If it's a large integer that looks like cents, convert
     if (Number.isInteger(preferred) && preferred >= 1000 && preferred <= 500000) return preferred / 100;
     if (preferred > 0 && preferred < 5000) return preferred;
     return 0;
   }
 
-  // object case: try inner amounts
   if (preferred && typeof preferred === "object") {
     const inner = deepGetByKey(preferred, ["value", "amount", "current", "min", "max", "price"]) ?? null;
     if (typeof inner === "number") {
@@ -170,14 +197,13 @@ function aliExtractPrice(item) {
     }
   }
 
-  // string case
   if (typeof preferred === "string") {
     const n = parsePriceFromString(preferred);
     return n > 0 && n < 5000 ? n : 0;
   }
 
-  // fallback scan: only accept strings that *look like prices*
-  const priceLike = deepFindFirst(item, (x) => {
+  // fallback scan: only accept strings that look like prices
+  const priceLike = deepFindFirst(obj, (x) => {
     if (typeof x !== "string") return false;
     const s = x.trim();
     if (s.length < 2 || s.length > 40) return false;
@@ -203,7 +229,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
-  // Rate limit (prevents accidental hammering)
+  // Rate limit
   const ip = getIp(req);
   const rl = rateLimitOk(ip, 10, 10 * 60 * 1000);
   res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
@@ -216,17 +242,13 @@ export default async function handler(req, res) {
 
   const debug = req.query.debug === "1";
 
-  // HARD CAPS (protect quota even if frontend asks for more)
+  // HARD CAPS
   const top = Math.min(parseInt(req.query.top || "25", 10) || 25, 50);
-
-  // Limit AliExpress work HARD (these are the biggest levers)
-  const aliSeedCap = Math.min(parseInt(req.query.seeds || "2", 10) || 2, 2);     // <= 2 Ali calls per request
+  const aliCallCap = Math.min(parseInt(req.query.seeds || "2", 10) || 2, 2); // <= 2 Ali calls/request
   const perSeedAliItems = Math.min(parseInt(req.query.perSeed || "10", 10) || 10, 10);
-
-  // Max eBay calls per request
   const ebayBudget = Math.min(parseInt(req.query.ebayBudget || "8", 10) || 8, 10);
 
-  // Cache full response by query string (30 min)
+  // Cache final response for 30 min
   const cacheKey = req.url;
   const cached = cacheGet(RESPONSE_CACHE, cacheKey);
   if (cached) {
@@ -249,7 +271,6 @@ export default async function handler(req, res) {
     CATEGORY_SEEDS[category] ||
     ["bluetooth earbuds", "usb c hub", "wireless charger", "dash cam", "car phone holder", "hair trimmer"];
 
-  // Track budgets
   let aliCalls = 0;
   let ebayCalls = 0;
 
@@ -259,7 +280,7 @@ export default async function handler(req, res) {
     const cached = cacheGet(ALI_CACHE, aliCacheKey);
     if (cached) return cached;
 
-    if (aliCalls >= aliSeedCap) {
+    if (aliCalls >= aliCallCap) {
       return { status: 0, url: "", providerStatus: null, raw_head: "", items: [], budgetExceeded: true };
     }
     aliCalls++;
@@ -303,11 +324,9 @@ export default async function handler(req, res) {
   }
 
   async function fetchEbayAvgSold(keywords) {
-    // 24h cache per keywords (massive saver)
     const cached = cacheGet(EBAY_CACHE, keywords);
     if (cached) return cached;
 
-    // Respect budget
     if (ebayCalls >= ebayBudget) {
       return { avgPrice: 0, link: "https://www.ebay.com", budgetExceeded: true };
     }
@@ -327,10 +346,9 @@ export default async function handler(req, res) {
       })
     });
 
-    // If eBay is rate-limited/denied, don’t keep hammering
     if (!resp.ok) {
       const data = { avgPrice: 0, link: "https://www.ebay.com", httpStatus: resp.status };
-      cacheSet(EBAY_CACHE, keywords, data, 30 * 60 * 1000); // cache failures briefly
+      cacheSet(EBAY_CACHE, keywords, data, 30 * 60 * 1000);
       return data;
     }
 
@@ -347,7 +365,7 @@ export default async function handler(req, res) {
       link: ebayData?.search_url || "https://www.ebay.com"
     };
 
-    cacheSet(EBAY_CACHE, keywords, data, 24 * 60 * 60 * 1000); // 24h
+    cacheSet(EBAY_CACHE, keywords, data, 24 * 60 * 60 * 1000);
     return data;
   }
 
@@ -355,7 +373,7 @@ export default async function handler(req, res) {
     const aliAll = [];
     const aliDebug = [];
 
-    for (const seed of SEEDS.slice(0, aliSeedCap)) {
+    for (const seed of SEEDS.slice(0, aliCallCap)) {
       const r = await fetchAliItems(seed, 1);
       if (r.budgetExceeded) break;
 
@@ -387,7 +405,6 @@ export default async function handler(req, res) {
       aliUnique.push(it);
     }
 
-    // Candidates (we won't check more than ebayBudget anyway)
     const candidates = aliUnique.slice(0, Math.max(ebayBudget * 2, 12));
 
     const results = [];
@@ -430,12 +447,12 @@ export default async function handler(req, res) {
     const payload = debug
       ? {
           debug: {
-            seeds_used: SEEDS.slice(0, aliSeedCap),
+            seeds_used: SEEDS.slice(0, aliCallCap),
             aliDebug,
             ali_total_fetched: aliAll.length,
             ali_unique: aliUnique.length,
             ali_calls_used: aliCalls,
-            ali_call_cap: aliSeedCap,
+            ali_call_cap: aliCallCap,
             ebay_calls_used: ebayCalls,
             ebay_budget: ebayBudget,
             ebay_budget_exceeded_count: ebayBudgetExceededCount,
@@ -443,8 +460,6 @@ export default async function handler(req, res) {
             ebay_zero_avg_count: ebayZeroCount,
             results_total: results.length,
             profitable_count: filtered.length,
-            ali_first_item_top_keys: aliAll[0] ? Object.keys(aliAll[0]) : [],
-            ali_first_item_shallow: aliAll[0] ? Object.fromEntries(Object.entries(aliAll[0]).slice(0, 25))  : null,
             ali_parsed_sample: candidates.slice(0, 3).map((it) => ({
               id: aliExtractId(it),
               title: aliExtractTitle(it),
@@ -459,9 +474,7 @@ export default async function handler(req, res) {
     res.setHeader("X-eBay-Calls", String(ebayCalls));
     res.setHeader("X-AliExpress-Calls", String(aliCalls));
 
-    // Cache final response 30 minutes
     cacheSet(RESPONSE_CACHE, cacheKey, payload, 30 * 60 * 1000);
-
     return res.status(200).json(payload);
   } catch (e) {
     return res.status(500).json({ error: "Backend error", details: String(e) });
