@@ -437,4 +437,8 @@ export default async function handler(req, res) {
     // Cache final response 30 minutes
     cacheSet(RESPONSE_CACHE, cacheKey, payload, 30 * 60 * 1000);
 
-    return res.status(200).json(p
+    return res.status(200).json(payload);
+  } catch (e) {
+    return res.status(500).json({ error: "Backend error", details: String(e) });
+  }
+}
