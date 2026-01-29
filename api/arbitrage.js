@@ -18,7 +18,6 @@ export default async function handler(req, res) {
   const debug = req.query.debug === "1";
   const category = String(req.query.category || "");
 
-  // Keep seed count small to reduce timeouts / quota burn
   const CATEGORY_SEEDS = {
     electronics: ["bluetooth earbuds", "usb c hub", "wireless charger", "mini projector"],
     automotive: ["dash cam", "car phone holder", "tire inflator"],
@@ -31,30 +30,26 @@ export default async function handler(req, res) {
     [
       ...CATEGORY_SEEDS.electronics.slice(0, 3),
       ...CATEGORY_SEEDS.automotive.slice(0, 2),
-      ...CATEGORY_SEEDS.health_beauty.slice(0, 2),
-      ...CATEGORY_SEEDS.home_garden.slice(0, 2),
+      ...CATEGORY_SEEDS.health_beauty.slice(0, 1),
       "bike light"
     ];
 
   const maxSeeds = Math.min(SEEDS.length, parseInt(req.query.seeds || "6", 10) || 6);
   const perSeedAliItems = Math.min(parseInt(req.query.perSeed || "15", 10) || 15, 30);
-  const checkCap = Math.min(parseInt(req.query.check || "35", 10) || 35, 100);
+  const checkCap = Math.min(parseInt(req.query.check || "35", 10) || 35, 120);
   const minProfit = Number.isFinite(parseFloat(req.query.minProfit))
     ? parseFloat(req.query.minProfit)
     : 0;
 
   // ----------------------------
-  // Deep helpers (AliExpress payload varies a lot)
+  // Deep helpers (Ali payload varies)
   // ----------------------------
-  function deepFindFirst(obj, predicate, maxNodes = 4000) {
-    // Iterative DFS to avoid recursion limits
+  function deepFindFirst(obj, predicate, maxNodes = 6000) {
     const stack = [obj];
     let nodes = 0;
-
     while (stack.length && nodes < maxNodes) {
       const cur = stack.pop();
       nodes++;
-
       if (predicate(cur)) return cur;
 
       if (cur && typeof cur === "object") {
@@ -69,14 +64,10 @@ export default async function handler(req, res) {
   }
 
   function deepGetByKey(obj, keys) {
-    // Find first occurrence of any key name (case-insensitive)
     const keySet = new Set(keys.map((k) => k.toLowerCase()));
     const found = deepFindFirst(obj, (x) => {
       if (!x || typeof x !== "object" || Array.isArray(x)) return false;
-      for (const k of Object.keys(x)) {
-        if (keySet.has(k.toLowerCase())) return true;
-      }
-      return false;
+      return Object.keys(x).some((k) => keySet.has(k.toLowerCase()));
     });
     if (!found) return null;
 
@@ -84,6 +75,14 @@ export default async function handler(req, res) {
       if (keySet.has(k.toLowerCase())) return found[k];
     }
     return null;
+  }
+
+  function normalizeAliLink(link) {
+    if (!link) return "";
+    let s = String(link).trim();
+    if (s.startsWith("//")) s = "https:" + s;
+    if (s.startsWith("www.")) s = "https://" + s;
+    return s;
   }
 
   function aliExtractTitle(item) {
@@ -97,25 +96,16 @@ export default async function handler(req, res) {
         "item_title",
         "displayTitle"
       ]) || "";
-
     return typeof v === "string" ? v.trim() : String(v || "").trim();
   }
 
   function aliExtractLink(item) {
-    // Prefer a real AliExpress item URL if present anywhere
+    const maybeItem = deepFindFirst(item, (x) => typeof x === "string" && /aliexpress\.com\/item\//i.test(x));
+    if (typeof maybeItem === "string") return normalizeAliLink(maybeItem);
+
     const urlLike = deepFindFirst(item, (x) => typeof x === "string" && x.includes("aliexpress.com"));
-    const s = typeof urlLike === "string" ? urlLike : "";
+    if (typeof urlLike === "string") return normalizeAliLink(urlLike);
 
-    // If we found any AE url, try to pick the /item/ style link if possible
-    if (s) {
-      const maybeItem = deepFindFirst(item, (x) =>
-        typeof x === "string" && /aliexpress\.com\/item\//i.test(x)
-      );
-      const picked = typeof maybeItem === "string" ? maybeItem : s;
-      return picked.trim();
-    }
-
-    // Fallback to common keys
     const v =
       deepGetByKey(item, [
         "product_url",
@@ -128,8 +118,7 @@ export default async function handler(req, res) {
         "itemLink",
         "productLink"
       ]) || "";
-
-    return typeof v === "string" ? v.trim() : String(v || "").trim();
+    return normalizeAliLink(typeof v === "string" ? v : String(v || ""));
   }
 
   function aliExtractId(item) {
@@ -146,8 +135,13 @@ export default async function handler(req, res) {
     return typeof v === "string" || typeof v === "number" ? String(v) : "";
   }
 
+  function parseFirstNumber(x) {
+    const m = String(x).match(/(\d+(\.\d+)?)/);
+    return m ? parseFloat(m[1]) : 0;
+  }
+
   function aliExtractPrice(item) {
-    // Try common numeric-ish fields first
+    // 1) Common keys (including "formatted/string" fields many APIs use)
     const v =
       deepGetByKey(item, [
         "current",
@@ -161,21 +155,54 @@ export default async function handler(req, res) {
         "maxPrice",
         "max_price",
         "originalPrice",
-        "original_price"
+        "original_price",
+        "price_format",
+        "priceFormat",
+        "price_str",
+        "priceStr",
+        "sale_price_format",
+        "target_price",
+        "targetPrice",
+        "final_price",
+        "finalPrice"
       ]) || "";
 
+    // If numeric, easy
     if (typeof v === "number") return v;
 
-    // If it's an object (like {current: "12.34"}), try another pass
+    // If object, try inner numeric-ish value
     if (v && typeof v === "object") {
-      const inner = deepGetByKey(v, ["current", "value", "min", "max", "price"]) || "";
+      const inner =
+        deepGetByKey(v, ["current", "value", "min", "max", "price", "amount"]) || "";
       if (typeof inner === "number") return inner;
-      const m2 = String(inner).match(/(\d+(\.\d+)?)/);
-      return m2 ? parseFloat(m2[1]) : 0;
+      const n = parseFirstNumber(inner);
+      if (n) return n;
     }
 
-    const m = String(v).match(/(\d+(\.\d+)?)/);
-    return m ? parseFloat(m[1]) : 0;
+    // If string contains a number, use it
+    const n1 = parseFirstNumber(v);
+    if (n1) return n1;
+
+    // 2) Fallback: scan the whole object for a plausible price string
+    // Look for strings like "$12.34", "US $12.34", "£9.99", "12.34"
+    const priceLike = deepFindFirst(item, (x) => {
+      if (typeof x !== "string") return false;
+      const s = x.trim();
+      if (s.length < 2 || s.length > 40) return false;
+      // must contain a number
+      if (!/\d/.test(s)) return false;
+      // avoid things like IDs
+      if (/^\d{10,}$/.test(s)) return false;
+      // look for currency or common price patterns
+      return /(\$|£|€|US\s?\$|GBP|EUR)\s*\d+(\.\d+)?/.test(s) || /^\d+(\.\d+)?$/.test(s);
+    });
+
+    if (typeof priceLike === "string") {
+      const n2 = parseFirstNumber(priceLike);
+      if (n2) return n2;
+    }
+
+    return 0;
   }
 
   // ----------------------------
@@ -210,10 +237,14 @@ export default async function handler(req, res) {
       aliData?.items ||
       [];
 
+    // Also capture provider error status even if HTTP 200
+    const providerStatus = aliData?.result?.status || null;
+
     return {
       status: aliResp.status,
       url: aliUrl,
       rawText: aliText,
+      providerStatus,
       items: Array.isArray(items) ? items : []
     };
   }
@@ -255,48 +286,51 @@ export default async function handler(req, res) {
     const aliDebug = [];
 
     for (const seed of SEEDS.slice(0, maxSeeds)) {
-      const { status, url, rawText, items } = await fetchAliItems(seed, 1);
+      const { status, url, rawText, providerStatus, items } = await fetchAliItems(seed, 1);
 
       aliDebug.push({
         seed,
         status,
         url,
         items_count: items.length,
+        provider_status_code: providerStatus?.code,
+        provider_status_data: providerStatus?.data,
         raw_head: rawText?.slice(0, 200)
       });
 
-      // Only add a slice to control quota
       for (const it of items.slice(0, perSeedAliItems)) aliAll.push(it);
     }
 
-    // De-dupe: prefer item id, then URL, then title|price
-    const seen = new Set();
-    const aliUnique = [];
-    for (const it of aliAll) {
-      const id = aliExtractId(it);
-      const title = aliExtractTitle(it);
-      const link = aliExtractLink(it);
-      const price = aliExtractPrice(it);
+    // De-dupe by id -> link -> title|price
+const seen = new Set();
+const aliUnique = [];
+for (const it of aliAll) {
+  const id = aliExtractId(it);
+  const title = aliExtractTitle(it);
+  const price = aliExtractPrice(it);
+  const link = aliExtractLink(it);
 
-      const key = id || link || `${title}|${price}`;
-      if (!key || !String(key).trim()) continue;
+  const key = id || link || `${title}|${price}`;
+  if (!key || !String(key).trim()) continue;
 
-      if (seen.has(key)) continue;
-      seen.add(key);
-      aliUnique.push(it);
-    }
+  if (seen.has(key)) continue;
+  seen.add(key);
+  aliUnique.push(it);
+}
 
     const candidates = aliUnique.slice(0, checkCap);
 
     const results = [];
     let ebayZeroCount = 0;
+    let aliZeroPriceCount = 0;
 
     for (const item of candidates) {
       const title = aliExtractTitle(item);
       const aliPrice = aliExtractPrice(item);
       const aliLink = aliExtractLink(item);
 
-      if (!title || !aliPrice || !aliLink) continue;
+      if (!title || !aliLink) continue;
+      if (!aliPrice) { aliZeroPriceCount++; continue; }
 
       const ebayKeywords = title.split(/\s+/).slice(0, 6).join(" ");
       const { avgPrice, link: ebayLink } = await fetchEbayAvgSold(ebayKeywords);
@@ -318,12 +352,11 @@ export default async function handler(req, res) {
     const filtered = results.filter((r) => r.profit > minProfit).slice(0, top);
 
     if (debug) {
-      // include a tiny sample of parsed fields to confirm extraction is working
-      const sample = candidates.slice(0, 2).map((it) => ({
+      const sample = candidates.slice(0, 3).map((it) => ({
         id: aliExtractId(it),
         title: aliExtractTitle(it),
         price: aliExtractPrice(it),
-        link: aliExtractLink(it)?.slice(0, 120) || ""
+        link: aliExtractLink(it)?.slice(0, 140) || ""
       }));
 
       return res.status(200).json({
@@ -334,6 +367,7 @@ export default async function handler(req, res) {
           ali_unique: aliUnique.length,
           ebay_checked: candidates.length,
           ebay_zero_avg_count: ebayZeroCount,
+          ali_zero_price_count: aliZeroPriceCount,
           results_total: results.length,
           profitable_count: filtered.length,
           ali_parsed_sample: sample
