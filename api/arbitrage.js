@@ -443,6 +443,8 @@ export default async function handler(req, res) {
             ebay_zero_avg_count: ebayZeroCount,
             results_total: results.length,
             profitable_count: filtered.length,
+            ali_first_item_top_keys: aliAll[0] ? Object.keys(aliAll[0]) : [],
+            ali_first_item_shallow: aliAll[0] ? Object.fromEntries(Object.entries(aliAll[0]).slice(0, 25))  : null,
             ali_parsed_sample: candidates.slice(0, 3).map((it) => ({
               id: aliExtractId(it),
               title: aliExtractTitle(it),
