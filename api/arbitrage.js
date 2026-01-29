@@ -2,8 +2,14 @@
 // Vercel serverless note: in-memory caches are "best effort" (may reset between cold starts),
 // but they still dramatically reduce RapidAPI usage during bursts/testing.
 
+// Response cache (final payload)
 const RESPONSE_CACHE = new Map(); // cacheKey -> { expires, payload }
+
+// Per-keyword caches
 const EBAY_CACHE = new Map();     // ebayKeywords -> { expires, data }
+const ALI_CACHE = new Map();      // aliKey -> { expires, data }
+
+// Simple rate limit
 const RATE_LIMIT = new Map();     // ip -> { windowStart, count }
 
 function getIp(req) {
@@ -210,12 +216,14 @@ export default async function handler(req, res) {
 
   const debug = req.query.debug === "1";
 
-  // HARD CAPS (these prevent expensive requests even if the frontend asks for more)
+  // HARD CAPS (protect quota even if frontend asks for more)
   const top = Math.min(parseInt(req.query.top || "25", 10) || 25, 50);
-  const maxSeeds = Math.min(parseInt(req.query.seeds || "4", 10) || 4, 4);
+
+  // Limit AliExpress work HARD (these are the biggest levers)
+  const aliSeedCap = Math.min(parseInt(req.query.seeds || "2", 10) || 2, 2);     // <= 2 Ali calls per request
   const perSeedAliItems = Math.min(parseInt(req.query.perSeed || "10", 10) || 10, 10);
 
-  // This is the big one: max eBay calls per request
+  // Max eBay calls per request
   const ebayBudget = Math.min(parseInt(req.query.ebayBudget || "8", 10) || 8, 10);
 
   // Cache full response by query string (30 min)
@@ -241,7 +249,21 @@ export default async function handler(req, res) {
     CATEGORY_SEEDS[category] ||
     ["bluetooth earbuds", "usb c hub", "wireless charger", "dash cam", "car phone holder", "hair trimmer"];
 
+  // Track budgets
+  let aliCalls = 0;
+  let ebayCalls = 0;
+
   async function fetchAliItems(query, page = 1) {
+    // 6 hour cache per query+page
+    const aliCacheKey = `${query}::${page}`;
+    const cached = cacheGet(ALI_CACHE, aliCacheKey);
+    if (cached) return cached;
+
+    if (aliCalls >= aliSeedCap) {
+      return { status: 0, url: "", providerStatus: null, raw_head: "", items: [], budgetExceeded: true };
+    }
+    aliCalls++;
+
     const aliUrl =
       `https://${RAPIDAPI_HOST_ALI}/item_search_2` +
       `?q=${encodeURIComponent(query)}` +
@@ -257,11 +279,7 @@ export default async function handler(req, res) {
 
     const aliText = await aliResp.text();
     let aliData = null;
-    try {
-      aliData = JSON.parse(aliText);
-    } catch {
-      aliData = null;
-    }
+    try { aliData = JSON.parse(aliText); } catch { aliData = null; }
 
     const items =
       aliData?.result?.items ||
@@ -272,27 +290,27 @@ export default async function handler(req, res) {
 
     const providerStatus = aliData?.result?.status || null;
 
-    return {
+    const out = {
       status: aliResp.status,
       url: aliUrl,
       providerStatus,
       raw_head: aliText.slice(0, 200),
       items: Array.isArray(items) ? items : []
     };
-  }
 
-  let ebayCalls = 0;
+    cacheSet(ALI_CACHE, aliCacheKey, out, 6 * 60 * 60 * 1000); // 6 hours
+    return out;
+  }
 
   async function fetchEbayAvgSold(keywords) {
     // 24h cache per keywords (massive saver)
     const cached = cacheGet(EBAY_CACHE, keywords);
     if (cached) return cached;
 
-    // Respect budget (prevents draining quota)
+    // Respect budget
     if (ebayCalls >= ebayBudget) {
       return { avgPrice: 0, link: "https://www.ebay.com", budgetExceeded: true };
     }
-
     ebayCalls++;
 
     const resp = await fetch(`https://${RAPIDAPI_HOST_EBAY}/findCompletedItems`, {
@@ -337,8 +355,10 @@ export default async function handler(req, res) {
     const aliAll = [];
     const aliDebug = [];
 
-    for (const seed of SEEDS.slice(0, maxSeeds)) {
+    for (const seed of SEEDS.slice(0, aliSeedCap)) {
       const r = await fetchAliItems(seed, 1);
+      if (r.budgetExceeded) break;
+
       aliDebug.push({
         seed,
         status: r.status,
@@ -367,13 +387,13 @@ export default async function handler(req, res) {
       aliUnique.push(it);
     }
 
-    // Build candidates (we won’t check more than ebayBudget anyway)
+    // Candidates (we won't check more than ebayBudget anyway)
     const candidates = aliUnique.slice(0, Math.max(ebayBudget * 2, 12));
 
     const results = [];
     let aliZeroPriceCount = 0;
     let ebayZeroCount = 0;
-    let budgetExceededCount = 0;
+    let ebayBudgetExceededCount = 0;
 
     for (const item of candidates) {
       const title = aliExtractTitle(item);
@@ -387,8 +407,8 @@ export default async function handler(req, res) {
       const ebay = await fetchEbayAvgSold(ebayKeywords);
 
       if (ebay.budgetExceeded) {
-        budgetExceededCount++;
-        break; // stop early once budget exceeded
+        ebayBudgetExceededCount++;
+        break;
       }
 
       if (!ebay.avgPrice) {
@@ -410,13 +430,15 @@ export default async function handler(req, res) {
     const payload = debug
       ? {
           debug: {
-            seeds_used: SEEDS.slice(0, maxSeeds),
+            seeds_used: SEEDS.slice(0, aliSeedCap),
             aliDebug,
             ali_total_fetched: aliAll.length,
             ali_unique: aliUnique.length,
+            ali_calls_used: aliCalls,
+            ali_call_cap: aliSeedCap,
             ebay_calls_used: ebayCalls,
             ebay_budget: ebayBudget,
-            budget_exceeded_count: budgetExceededCount,
+            ebay_budget_exceeded_count: ebayBudgetExceededCount,
             ali_zero_price_count: aliZeroPriceCount,
             ebay_zero_avg_count: ebayZeroCount,
             results_total: results.length,
@@ -433,6 +455,7 @@ export default async function handler(req, res) {
       : { items: filtered };
 
     res.setHeader("X-eBay-Calls", String(ebayCalls));
+    res.setHeader("X-AliExpress-Calls", String(aliCalls));
 
     // Cache final response 30 minutes
     cacheSet(RESPONSE_CACHE, cacheKey, payload, 30 * 60 * 1000);
