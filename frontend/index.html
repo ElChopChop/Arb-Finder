@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AliExpress → eBay Arbitrage Finder</title>
+<style>
+body { font-family: Arial, sans-serif; padding: 20px; }
+select, button { padding: 6px; margin-left: 5px; }
+.product { border: 1px solid #ccc; padding: 10px; margin: 12px 0; }
+.profit { font-weight: bold; color: green; }
+</style>
+</head>
+<body>
+
+
+<h1>AliExpress → eBay Arbitrage Finder</h1>
+
+
+<label>Category:</label>
+<select id="category">
+<option value="">Select</option>
+<option value="electronics">Electronics</option>
+<option value="automotive">Automotive</option>
+<option value="health_beauty">Health & Beauty</option>
+<option value="home_garden">Home & Garden</option>
+</select>
+
+
+<button onclick="loadData()">Find Opportunities</button>
+
+
+<div id="results"></div>
+
+
+<script>
+async function loadData() {
+const category = document.getElementById("category").value;
+if (!category) return alert("Select a category");
+
+
+const resultsDiv = document.getElementById("results");
+resultsDiv.innerHTML = "Loading...";
+
+
+try {
+const res = await fetch(`http://localhost:3000/arbitrage?category=${category}`);
+const data = await res.json();
+
+
+if (!data.items.length) {
+resultsDiv.innerHTML = "No profitable items found.";
+return;
+}
+
+
+resultsDiv.innerHTML = data.items.map(item => `
+<div class="product">
+<h3>${item.title}</h3>
+<p>AliExpress: £${item.aliexpress.price.toFixed(2)}
+<a href="${item.aliexpress.link}" target="_blank">View</a></p>
+<p>eBay (avg sold): £${item.ebay.price.toFixed(2)}
+<a href="${item.ebay.link}" target="_blank">View</a></p>
+<p class="profit">Estimated Profit: £${item.profit.toFixed(2)}</p>
+</div>
+`).join('');
+
+
+} catch (err) {
+resultsDiv.innerHTML = "Error loading data.";
+}
+}
+</script>
+
+
+</body>
+</html>
