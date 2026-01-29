@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // CORS (so GitHub Pages can call it)
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -7,85 +7,41 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
-  const { category } = req.query;
-
-  const CATEGORY_KEYWORDS = {
-    electronics: "electronics gadget",
-    automotive: "car accessory",
-    health_beauty: "beauty device",
-    home_garden: "home gadget",
-  };
-
-  if (!category || !CATEGORY_KEYWORDS[category]) {
-    return res.status(400).json({ error: "Invalid category" });
-  }
-
   const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
   const RAPIDAPI_HOST_ALI = process.env.RAPIDAPI_HOST_ALI || "aliexpress-datahub.p.rapidapi.com";
   const RAPIDAPI_HOST_EBAY = process.env.RAPIDAPI_HOST_EBAY || "ebay-average-selling-price.p.rapidapi.com";
 
-  try {
-    // 1) AliExpress search
-    const aliUrl = `https://${RAPIDAPI_HOST_ALI}/item_search?q=${encodeURIComponent(
-      CATEGORY_KEYWORDS[category]
-    )}&page=1`;
+  if (!RAPIDAPI_KEY) return res.status(500).json({ error: "Missing RAPIDAPI_KEY env var" });
 
-    const aliResp = await fetch(aliUrl, {
-      headers: {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": RAPIDAPI_HOST_ALI,
-      },
-    });
+  const top = Math.min(parseInt(req.query.top || "50", 10) || 50, 200); // cap to 200
+  const debug = req.query.debug === "1";
 
-    const aliData = await aliResp.json();
-    const items = aliData?.result?.items || [];
+  // Optional category mode (still supported)
+  const category = req.query.category;
 
-    const results = [];
+  const CATEGORY_KEYWORDS = {
+    electronics: ["bluetooth earbuds", "smart watch", "usb c hub", "wireless charger"],
+    automotive: ["car phone holder", "obd2 scanner", "led headlight", "dash cam"],
+    health_beauty: ["nail drill", "hair trimmer", "facial cleansing brush", "epilator"],
+    home_garden: ["led strip lights", "kitchen gadget", "storage organizer", "shower head"],
+  };
 
-    // 2) For each item, get eBay completed average
-    for (const item of items.slice(0, 10)) {
-      const title = item?.title;
-      const aliPrice = parseFloat(item?.price?.current || item?.price?.min || item?.price?.value || "0");
-      if (!title || !aliPrice) continue;
+  // If category provided, use those seeds; else use a broad set of seeds across categories
+  const SEEDS = category && CATEGORY_KEYWORDS[category]
+    ? CATEGORY_KEYWORDS[category]
+    : [
+        // Electronics
+        "bluetooth earbuds", "smart watch", "usb c hub", "wireless charger", "mini projector",
+        // Automotive
+        "dash cam", "obd2 scanner", "car phone holder", "led headlight",
+        // Health & Beauty
+        "nail drill", "hair trimmer", "facial cleansing brush",
+        // Home
+        "led strip lights", "shower head", "storage organizer", "kitchen gadget",
+        // Misc proven AliExpress movers
+        "pet grooming", "bike light", "portable fan"
+      ];
 
-      const ebayResp = await fetch(`https://${RAPIDAPI_HOST_EBAY}/findCompletedItems`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-RapidAPI-Key": RAPIDAPI_KEY,
-          "X-RapidAPI-Host": RAPIDAPI_HOST_EBAY,
-        },
-        body: JSON.stringify({
-          keywords: title.split(" ").slice(0, 6).join(" "), // improves matching
-          max_search_results: 20,
-          site_id: "0",
-        }),
-      });
-
-      const ebayData = await ebayResp.json();
-      const avgPrice = parseFloat(
-        ebayData?.average_price || ebayData?.avg_price || ebayData?.data?.average_price || "0"
-      );
-
-      if (!avgPrice) continue;
-
-      const profit = avgPrice - aliPrice;
-
-      results.push({
-        title,
-        aliexpress: { price: aliPrice, link: item?.product_url },
-        ebay: { price: avgPrice, link: ebayData?.search_url || "https://www.ebay.com" },
-        profit,
-      });
-    }
-
-    results.sort((a, b) => b.profit - a.profit);
-
-    // Optional: only show profitable ones
-    const profitable = results.filter((x) => x.profit > 0);
-
-    return res.status(200).json({ items: profitable });
-  } catch (e) {
-    return res.status(500).json({ error: "Backend error", details: String(e) });
-  }
-}
+  // Helper: fetch AliExpress items for a seed query
+  async function fetchAliItems(query, page = 1) {
+    const aliUrl =
