@@ -1,186 +1,246 @@
 // api/arbitrage.js
+// Vercel serverless note: in-memory caches are "best effort" (may reset between cold starts),
+// but they still dramatically reduce RapidAPI usage during bursts/testing.
+
+const RESPONSE_CACHE = new Map(); // cacheKey -> { expires, payload }
+const EBAY_CACHE = new Map();     // ebayKeywords -> { expires, data }
+const RATE_LIMIT = new Map();     // ip -> { windowStart, count }
+
+function getIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  return fwd ? String(fwd).split(",")[0].trim() : "unknown";
+}
+
+function rateLimitOk(ip, limit = 10, windowMs = 10 * 60 * 1000) {
+  const now = Date.now();
+  const entry = RATE_LIMIT.get(ip);
+  if (!entry || now - entry.windowStart > windowMs) {
+    RATE_LIMIT.set(ip, { windowStart: now, count: 1 });
+    return { ok: true, remaining: limit - 1 };
+  }
+  if (entry.count >= limit) return { ok: false, remaining: 0 };
+  entry.count += 1;
+  return { ok: true, remaining: limit - entry.count };
+}
+
+function cacheGet(map, key) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expires) {
+    map.delete(key);
+    return null;
+  }
+  return hit.payload ?? hit.data ?? null;
+}
+
+function cacheSet(map, key, value, ttlMs) {
+  map.set(key, { expires: Date.now() + ttlMs, payload: value, data: value });
+}
+
+function normalizeAliLink(link) {
+  if (!link) return "";
+  let s = String(link).trim();
+  if (s.startsWith("//")) s = "https:" + s;
+  if (s.startsWith("www.")) s = "https://" + s;
+  return s;
+}
+
+function parsePriceFromString(s) {
+  if (!s) return 0;
+  const str = String(s).trim();
+  if (!str) return 0;
+
+  // reject very long digit-only strings (IDs)
+  if (/^\d{8,}$/.test(str)) return 0;
+
+  // normalize comma decimals
+  const norm = str.replace(",", ".");
+
+  const m = norm.match(/(\d+(\.\d+)?)/);
+  if (!m) return 0;
+
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return 0;
+  if (n <= 0 || n > 10000) return 0; // sanity
+  return n;
+}
+
+function deepFindFirst(obj, predicate, maxNodes = 7000) {
+  const stack = [obj];
+  let nodes = 0;
+  while (stack.length && nodes < maxNodes) {
+    const cur = stack.pop();
+    nodes++;
+    if (predicate(cur)) return cur;
+
+    if (cur && typeof cur === "object") {
+      if (Array.isArray(cur)) {
+        for (let i = cur.length - 1; i >= 0; i--) stack.push(cur[i]);
+      } else {
+        for (const k of Object.keys(cur)) stack.push(cur[k]);
+      }
+    }
+  }
+  return null;
+}
+
+function deepGetByKey(obj, keys) {
+  const keySet = new Set(keys.map((k) => k.toLowerCase()));
+  const found = deepFindFirst(obj, (x) => {
+    if (!x || typeof x !== "object" || Array.isArray(x)) return false;
+    return Object.keys(x).some((k) => keySet.has(k.toLowerCase()));
+  });
+  if (!found) return null;
+
+  for (const k of Object.keys(found)) {
+    if (keySet.has(k.toLowerCase())) return found[k];
+  }
+  return null;
+}
+
+function aliExtractId(item) {
+  const v =
+    deepGetByKey(item, ["itemId", "item_id", "productId", "product_id", "id", "offerId", "offer_id"]) ||
+    "";
+  return typeof v === "string" || typeof v === "number" ? String(v) : "";
+}
+
+function aliExtractTitle(item) {
+  const v =
+    deepGetByKey(item, ["title", "productTitle", "product_title", "name", "itemTitle", "item_title"]) ||
+    "";
+  return typeof v === "string" ? v.trim() : String(v || "").trim();
+}
+
+function aliExtractLink(item) {
+  const maybeItem = deepFindFirst(item, (x) => typeof x === "string" && /aliexpress\.com\/item\//i.test(x));
+  if (typeof maybeItem === "string") return normalizeAliLink(maybeItem);
+
+  const urlLike = deepFindFirst(item, (x) => typeof x === "string" && /aliexpress\.com/i.test(x));
+  if (typeof urlLike === "string") return normalizeAliLink(urlLike);
+
+  const v =
+    deepGetByKey(item, ["product_url", "productUrl", "item_url", "itemUrl", "detail_url", "detailUrl", "url"]) ||
+    "";
+  return normalizeAliLink(typeof v === "string" ? v : String(v || ""));
+}
+
+function aliExtractPrice(item) {
+  // Prefer explicit “formatted/string” price fields if present
+  const preferred =
+    deepGetByKey(item, [
+      "sale_price_format",
+      "price_format",
+      "price_str",
+      "salePrice",
+      "sale_price",
+      "currentPrice",
+      "current_price",
+      "price",
+      "minPrice",
+      "min_price",
+      "final_price",
+      "finalPrice"
+    ]) ?? null;
+
+  // number case: may be cents or units; apply cautious heuristic
+  if (typeof preferred === "number") {
+    // If it's a large integer that looks like cents, convert
+    if (Number.isInteger(preferred) && preferred >= 1000 && preferred <= 500000) return preferred / 100;
+    if (preferred > 0 && preferred < 5000) return preferred;
+    return 0;
+  }
+
+  // object case: try inner amounts
+  if (preferred && typeof preferred === "object") {
+    const inner = deepGetByKey(preferred, ["value", "amount", "current", "min", "max", "price"]) ?? null;
+    if (typeof inner === "number") {
+      if (Number.isInteger(inner) && inner >= 1000 && inner <= 500000) return inner / 100;
+      return inner > 0 && inner < 5000 ? inner : 0;
+    }
+    if (typeof inner === "string") {
+      const n = parsePriceFromString(inner);
+      return n > 0 && n < 5000 ? n : 0;
+    }
+  }
+
+  // string case
+  if (typeof preferred === "string") {
+    const n = parsePriceFromString(preferred);
+    return n > 0 && n < 5000 ? n : 0;
+  }
+
+  // fallback scan: only accept strings that *look like prices*
+  const priceLike = deepFindFirst(item, (x) => {
+    if (typeof x !== "string") return false;
+    const s = x.trim();
+    if (s.length < 2 || s.length > 40) return false;
+    if (/^\d{8,}$/.test(s)) return false; // IDs
+    const hasCurrency = /(\$|£|€|US\s?\$|GBP|EUR)/.test(s);
+    const hasDecimal = /\d+[.,]\d{1,2}\b/.test(s);
+    return (hasCurrency || hasDecimal) && /\d/.test(s);
+  });
+
+  if (typeof priceLike === "string") {
+    const n = parsePriceFromString(priceLike);
+    return n > 0 && n < 5000 ? n : 0;
+  }
+
+  return 0;
+}
+
 export default async function handler(req, res) {
-  // CORS for GitHub Pages
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
+  // Rate limit (prevents accidental hammering)
+  const ip = getIp(req);
+  const rl = rateLimitOk(ip, 10, 10 * 60 * 1000);
+  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
+  if (!rl.ok) return res.status(429).json({ error: "Rate limit exceeded. Try again later." });
+
   const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
   const RAPIDAPI_HOST_ALI = process.env.RAPIDAPI_HOST_ALI || "aliexpress-datahub.p.rapidapi.com";
-  const RAPIDAPI_HOST_EBAY =
-    process.env.RAPIDAPI_HOST_EBAY || "ebay-average-selling-price.p.rapidapi.com";
-
+  const RAPIDAPI_HOST_EBAY = process.env.RAPIDAPI_HOST_EBAY || "ebay-average-selling-price.p.rapidapi.com";
   if (!RAPIDAPI_KEY) return res.status(500).json({ error: "Missing RAPIDAPI_KEY env var" });
 
-  const top = Math.min(parseInt(req.query.top || "50", 10) || 50, 200);
   const debug = req.query.debug === "1";
-  const category = String(req.query.category || "");
 
-  // Keep seed count small to reduce timeouts / quota burn
+  // HARD CAPS (these prevent expensive requests even if the frontend asks for more)
+  const top = Math.min(parseInt(req.query.top || "25", 10) || 25, 50);
+  const maxSeeds = Math.min(parseInt(req.query.seeds || "4", 10) || 4, 4);
+  const perSeedAliItems = Math.min(parseInt(req.query.perSeed || "10", 10) || 10, 10);
+
+  // This is the big one: max eBay calls per request
+  const ebayBudget = Math.min(parseInt(req.query.ebayBudget || "8", 10) || 8, 10);
+
+  // Cache full response by query string (30 min)
+  const cacheKey = req.url;
+  const cached = cacheGet(RESPONSE_CACHE, cacheKey);
+  if (cached) {
+    res.setHeader("X-Cache", "HIT");
+    return res.status(200).json(cached);
+  }
+  res.setHeader("X-Cache", "MISS");
+
+  const category = String(req.query.category || "");
+  const minProfit = Number.isFinite(parseFloat(req.query.minProfit)) ? parseFloat(req.query.minProfit) : 0;
+
   const CATEGORY_SEEDS = {
     electronics: ["bluetooth earbuds", "usb c hub", "wireless charger", "mini projector"],
-    automotive: ["dash cam", "car phone holder", "tire inflator"],
+    automotive: ["dash cam", "car phone holder", "tire inflator", "obd2 scanner"],
     health_beauty: ["hair trimmer", "nail drill", "massage gun"],
     home_garden: ["led strip lights", "handheld vacuum", "storage organizer"]
   };
 
   const SEEDS =
     CATEGORY_SEEDS[category] ||
-    [
-      ...CATEGORY_SEEDS.electronics.slice(0, 3),
-      ...CATEGORY_SEEDS.automotive.slice(0, 2),
-      ...CATEGORY_SEEDS.health_beauty.slice(0, 2),
-      ...CATEGORY_SEEDS.home_garden.slice(0, 2),
-      "bike light"
-    ];
+    ["bluetooth earbuds", "usb c hub", "wireless charger", "dash cam", "car phone holder", "hair trimmer"];
 
-  const maxSeeds = Math.min(SEEDS.length, parseInt(req.query.seeds || "6", 10) || 6);
-  const perSeedAliItems = Math.min(parseInt(req.query.perSeed || "15", 10) || 15, 30);
-  const checkCap = Math.min(parseInt(req.query.check || "35", 10) || 35, 100);
-  const minProfit = Number.isFinite(parseFloat(req.query.minProfit))
-    ? parseFloat(req.query.minProfit)
-    : 0;
-
-  // ----------------------------
-  // Deep helpers (AliExpress payload varies a lot)
-  // ----------------------------
-  function deepFindFirst(obj, predicate, maxNodes = 4000) {
-    // Iterative DFS to avoid recursion limits
-    const stack = [obj];
-    let nodes = 0;
-
-    while (stack.length && nodes < maxNodes) {
-      const cur = stack.pop();
-      nodes++;
-
-      if (predicate(cur)) return cur;
-
-      if (cur && typeof cur === "object") {
-        if (Array.isArray(cur)) {
-          for (let i = cur.length - 1; i >= 0; i--) stack.push(cur[i]);
-        } else {
-          for (const k of Object.keys(cur)) stack.push(cur[k]);
-        }
-      }
-    }
-    return null;
-  }
-
-  function deepGetByKey(obj, keys) {
-    // Find first occurrence of any key name (case-insensitive)
-    const keySet = new Set(keys.map((k) => k.toLowerCase()));
-    const found = deepFindFirst(obj, (x) => {
-      if (!x || typeof x !== "object" || Array.isArray(x)) return false;
-      for (const k of Object.keys(x)) {
-        if (keySet.has(k.toLowerCase())) return true;
-      }
-      return false;
-    });
-    if (!found) return null;
-
-    for (const k of Object.keys(found)) {
-      if (keySet.has(k.toLowerCase())) return found[k];
-    }
-    return null;
-  }
-
-  function aliExtractTitle(item) {
-    const v =
-      deepGetByKey(item, [
-        "title",
-        "productTitle",
-        "product_title",
-        "name",
-        "itemTitle",
-        "item_title",
-        "displayTitle"
-      ]) || "";
-
-    return typeof v === "string" ? v.trim() : String(v || "").trim();
-  }
-
-  function aliExtractLink(item) {
-    // Prefer a real AliExpress item URL if present anywhere
-    const urlLike = deepFindFirst(item, (x) => typeof x === "string" && x.includes("aliexpress.com"));
-    const s = typeof urlLike === "string" ? urlLike : "";
-
-    // If we found any AE url, try to pick the /item/ style link if possible
-    if (s) {
-      const maybeItem = deepFindFirst(item, (x) =>
-        typeof x === "string" && /aliexpress\.com\/item\//i.test(x)
-      );
-      const picked = typeof maybeItem === "string" ? maybeItem : s;
-      return picked.trim();
-    }
-
-    // Fallback to common keys
-    const v =
-      deepGetByKey(item, [
-        "product_url",
-        "productUrl",
-        "item_url",
-        "itemUrl",
-        "detail_url",
-        "detailUrl",
-        "url",
-        "itemLink",
-        "productLink"
-      ]) || "";
-
-    return typeof v === "string" ? v.trim() : String(v || "").trim();
-  }
-
-  function aliExtractId(item) {
-    const v =
-      deepGetByKey(item, [
-        "itemId",
-        "item_id",
-        "productId",
-        "product_id",
-        "id",
-        "offerId",
-        "offer_id"
-      ]) || "";
-    return typeof v === "string" || typeof v === "number" ? String(v) : "";
-  }
-
-  function aliExtractPrice(item) {
-    // Try common numeric-ish fields first
-    const v =
-      deepGetByKey(item, [
-        "current",
-        "currentPrice",
-        "current_price",
-        "salePrice",
-        "sale_price",
-        "price",
-        "minPrice",
-        "min_price",
-        "maxPrice",
-        "max_price",
-        "originalPrice",
-        "original_price"
-      ]) || "";
-
-    if (typeof v === "number") return v;
-
-    // If it's an object (like {current: "12.34"}), try another pass
-    if (v && typeof v === "object") {
-      const inner = deepGetByKey(v, ["current", "value", "min", "max", "price"]) || "";
-      if (typeof inner === "number") return inner;
-      const m2 = String(inner).match(/(\d+(\.\d+)?)/);
-      return m2 ? parseFloat(m2[1]) : 0;
-    }
-
-    const m = String(v).match(/(\d+(\.\d+)?)/);
-    return m ? parseFloat(m[1]) : 0;
-  }
-
-  // ----------------------------
-  // RapidAPI fetchers
-  // ----------------------------
   async function fetchAliItems(query, page = 1) {
     const aliUrl =
       `https://${RAPIDAPI_HOST_ALI}/item_search_2` +
@@ -210,16 +270,32 @@ export default async function handler(req, res) {
       aliData?.items ||
       [];
 
+    const providerStatus = aliData?.result?.status || null;
+
     return {
       status: aliResp.status,
       url: aliUrl,
-      rawText: aliText,
+      providerStatus,
+      raw_head: aliText.slice(0, 200),
       items: Array.isArray(items) ? items : []
     };
   }
 
+  let ebayCalls = 0;
+
   async function fetchEbayAvgSold(keywords) {
-    const ebayResp = await fetch(`https://${RAPIDAPI_HOST_EBAY}/findCompletedItems`, {
+    // 24h cache per keywords (massive saver)
+    const cached = cacheGet(EBAY_CACHE, keywords);
+    if (cached) return cached;
+
+    // Respect budget (prevents draining quota)
+    if (ebayCalls >= ebayBudget) {
+      return { avgPrice: 0, link: "https://www.ebay.com", budgetExceeded: true };
+    }
+
+    ebayCalls++;
+
+    const resp = await fetch(`https://${RAPIDAPI_HOST_EBAY}/findCompletedItems`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -233,75 +309,89 @@ export default async function handler(req, res) {
       })
     });
 
-    const ebayData = await ebayResp.json();
+    // If eBay is rate-limited/denied, don’t keep hammering
+    if (!resp.ok) {
+      const data = { avgPrice: 0, link: "https://www.ebay.com", httpStatus: resp.status };
+      cacheSet(EBAY_CACHE, keywords, data, 30 * 60 * 1000); // cache failures briefly
+      return data;
+    }
+
+    const ebayData = await resp.json();
     const avgPrice = parseFloat(
       ebayData?.average_price ||
-        ebayData?.avg_price ||
-        ebayData?.data?.average_price ||
-        "0"
+      ebayData?.avg_price ||
+      ebayData?.data?.average_price ||
+      "0"
     );
 
-    return {
-      avgPrice,
+    const data = {
+      avgPrice: Number.isFinite(avgPrice) ? avgPrice : 0,
       link: ebayData?.search_url || "https://www.ebay.com"
     };
+
+    cacheSet(EBAY_CACHE, keywords, data, 24 * 60 * 60 * 1000); // 24h
+    return data;
   }
 
-  // ----------------------------
-  // Main
-  // ----------------------------
   try {
     const aliAll = [];
     const aliDebug = [];
 
     for (const seed of SEEDS.slice(0, maxSeeds)) {
-      const { status, url, rawText, items } = await fetchAliItems(seed, 1);
-
+      const r = await fetchAliItems(seed, 1);
       aliDebug.push({
         seed,
-        status,
-        url,
-        items_count: items.length,
-        raw_head: rawText?.slice(0, 200)
+        status: r.status,
+        url: r.url,
+        items_count: r.items.length,
+        provider_status_code: r.providerStatus?.code,
+        provider_status_data: r.providerStatus?.data,
+        raw_head: r.raw_head
       });
 
-      // Only add a slice to control quota
-      for (const it of items.slice(0, perSeedAliItems)) aliAll.push(it);
+      for (const it of r.items.slice(0, perSeedAliItems)) aliAll.push(it);
     }
 
-    // De-dupe: prefer item id, then URL, then title|price
+    // De-dupe by id -> link -> title|price
     const seen = new Set();
     const aliUnique = [];
     for (const it of aliAll) {
       const id = aliExtractId(it);
       const title = aliExtractTitle(it);
-      const link = aliExtractLink(it);
       const price = aliExtractPrice(it);
-
+      const link = aliExtractLink(it);
       const key = id || link || `${title}|${price}`;
       if (!key || !String(key).trim()) continue;
-
       if (seen.has(key)) continue;
       seen.add(key);
       aliUnique.push(it);
     }
 
-    const candidates = aliUnique.slice(0, checkCap);
+    // Build candidates (we won’t check more than ebayBudget anyway)
+    const candidates = aliUnique.slice(0, Math.max(ebayBudget * 2, 12));
 
     const results = [];
+    let aliZeroPriceCount = 0;
     let ebayZeroCount = 0;
+    let budgetExceededCount = 0;
 
     for (const item of candidates) {
       const title = aliExtractTitle(item);
       const aliPrice = aliExtractPrice(item);
       const aliLink = aliExtractLink(item);
 
-      if (!title || !aliPrice || !aliLink) continue;
+      if (!title || !aliLink) continue;
+      if (!aliPrice) { aliZeroPriceCount++; continue; }
 
       const ebayKeywords = title.split(/\s+/).slice(0, 6).join(" ");
-      const { avgPrice, link: ebayLink } = await fetchEbayAvgSold(ebayKeywords);
+      const ebay = await fetchEbayAvgSold(ebayKeywords);
 
-      if (!avgPrice) {
+      if (ebay.budgetExceeded) {
+        budgetExceededCount++;
+        break; // stop early once budget exceeded
+      }
+
+      if (!ebay.avgPrice) {
         ebayZeroCount++;
         continue;
       }
@@ -309,41 +399,42 @@ export default async function handler(req, res) {
       results.push({
         title,
         aliexpress: { price: aliPrice, link: aliLink },
-        ebay: { price: avgPrice, link: ebayLink },
-        profit: avgPrice - aliPrice
+        ebay: { price: ebay.avgPrice, link: ebay.link },
+        profit: ebay.avgPrice - aliPrice
       });
     }
 
     results.sort((a, b) => b.profit - a.profit);
     const filtered = results.filter((r) => r.profit > minProfit).slice(0, top);
 
-    if (debug) {
-      // include a tiny sample of parsed fields to confirm extraction is working
-      const sample = candidates.slice(0, 2).map((it) => ({
-        id: aliExtractId(it),
-        title: aliExtractTitle(it),
-        price: aliExtractPrice(it),
-        link: aliExtractLink(it)?.slice(0, 120) || ""
-      }));
+    const payload = debug
+      ? {
+          debug: {
+            seeds_used: SEEDS.slice(0, maxSeeds),
+            aliDebug,
+            ali_total_fetched: aliAll.length,
+            ali_unique: aliUnique.length,
+            ebay_calls_used: ebayCalls,
+            ebay_budget: ebayBudget,
+            budget_exceeded_count: budgetExceededCount,
+            ali_zero_price_count: aliZeroPriceCount,
+            ebay_zero_avg_count: ebayZeroCount,
+            results_total: results.length,
+            profitable_count: filtered.length,
+            ali_parsed_sample: candidates.slice(0, 3).map((it) => ({
+              id: aliExtractId(it),
+              title: aliExtractTitle(it),
+              price: aliExtractPrice(it),
+              link: aliExtractLink(it)
+            }))
+          },
+          items: filtered
+        }
+      : { items: filtered };
 
-      return res.status(200).json({
-        debug: {
-          seeds_used: SEEDS.slice(0, maxSeeds),
-          aliDebug,
-          ali_total_fetched: aliAll.length,
-          ali_unique: aliUnique.length,
-          ebay_checked: candidates.length,
-          ebay_zero_avg_count: ebayZeroCount,
-          results_total: results.length,
-          profitable_count: filtered.length,
-          ali_parsed_sample: sample
-        },
-        items: filtered
-      });
-    }
+    res.setHeader("X-eBay-Calls", String(ebayCalls));
 
-    return res.status(200).json({ items: filtered });
-  } catch (e) {
-    return res.status(500).json({ error: "Backend error", details: String(e) });
-  }
-}
+    // Cache final response 30 minutes
+    cacheSet(RESPONSE_CACHE, cacheKey, payload, 30 * 60 * 1000);
+
+    return res.status(200).json(p
